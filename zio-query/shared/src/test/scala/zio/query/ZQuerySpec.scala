@@ -61,7 +61,7 @@ object ZQuerySpec extends ZIOBaseSpec {
       testM("arbitrary effects can be executed in parallel") {
         for {
           promise <- Promise.make[Nothing, Unit]
-          _       <- (ZQuery.never <&> ZQuery.fromEffect(promise.succeed(()))).run.fork
+          _       <- (ZQuery.never <&> ZQuery.fromEffectBackground(promise.succeed(()))).run.fork
           _       <- promise.await
         } yield assertCompletes
       },

@@ -42,7 +42,10 @@ import zio.query.internal._
  * Concise Data Access" by Simon Marlow, Louis Brandy, Jonathan Coens, and Jon
  * Purdy. [[http://simonmar.github.io/bib/papers/haxl-icfp14.pdf]]
  */
-final class ZQuery[-R, +E, +A] private (private val step: ZIO[(R, QueryContext), Nothing, Result[R, E, A]]) { self =>
+final class ZQuery[-R, +E, +A] private (
+  private val start: ZIO[(R, QueryContext), Nothing, Any],
+  private val result: ZIO[(R, QueryContext), Nothing, Result[R, E, A]]
+) { self =>
 
   /**
    * Syntax for adding aspects.
@@ -128,6 +131,20 @@ final class ZQuery[-R, +E, +A] private (private val step: ZIO[(R, QueryContext),
         case Result.Fail(e)        => ZIO.succeedNow(Result.fail(e))
       }
     }
+
+  // final def flatMap[R1 <: R, E1 >: E, B](f: A => ZQuery[R1, E1, B]): ZQuery[R1, E1, B] = {
+  //   val promise = Promise.unsafeMake[Nothing, Result[R1, E1, B]](Fiber.Id.None)
+  //   new ZQuery(
+  //     start *> result.flatMap {
+  //       case Result.Blocked(br, c) => ZIO.succeedNow(Result.blocked(br, c.mapM(f))).to(promise)
+  //       case Result.Done(a) =>
+  //         val query = f(a)
+  //         query.start *> query.result.to(promise)
+  //       case Result.Fail(e) => ZIO.succeedNow(Result.fail(e)).to(promise)
+  //     }.fork,
+  //     promise.await
+  //   )
+  // }
 
   /**
    * Folds over the failed or successful result of this query to yield a query
@@ -367,8 +384,9 @@ final class ZQuery[-R, +E, +A] private (private val step: ZIO[(R, QueryContext),
    * automatically be batched.
    */
   final def zipWithPar[R1 <: R, E1 >: E, B, C](that: ZQuery[R1, E1, B])(f: (A, B) => C): ZQuery[R1, E1, C] =
-    ZQuery {
-      self.step.zipWithPar(that.step) {
+    new ZQuery(
+      self.start *> that.start,
+      self.result.zipWith(that.result) {
         case (Result.Blocked(br1, c1), Result.Blocked(br2, c2)) => Result.blocked(br1 && br2, c1.zipWithPar(c2)(f))
         case (Result.Blocked(br, c), Result.Done(b))            => Result.blocked(br, c.map(a => f(a, b)))
         case (Result.Done(a), Result.Blocked(br, c))            => Result.blocked(br, c.map(b => f(a, b)))
@@ -377,7 +395,10 @@ final class ZQuery[-R, +E, +A] private (private val step: ZIO[(R, QueryContext),
         case (Result.Fail(e), _)                                => Result.fail(e)
         case (_, Result.Fail(e))                                => Result.fail(e)
       }
-    }
+    )
+
+  private final def step: ZIO[(R, QueryContext), Nothing, Result[R, E, A]] =
+    start *> result
 }
 
 object ZQuery {
@@ -481,6 +502,17 @@ object ZQuery {
     ZQuery(effect.foldCause(Result.fail, Result.done).provideSome(_._1))
 
   /**
+   * Constructs a query from an effect.
+   */
+  def fromEffectBackground[R, E, A](effect: ZIO[R, E, A]): ZQuery[R, E, A] = {
+    val promise = Promise.unsafeMake[E, A](Fiber.Id.None)
+    new ZQuery(
+      effect.provideSome[(R, QueryContext)](_._1).to(promise).fork,
+      promise.await.foldCause(Result.fail, Result.done)
+    )
+  }
+
+  /**
    * Constructs a query from a request and a data source. Queries will die with
    * a `QueryFailure` when run if the data source does not provide results for
    * all requests received. Queries must be constructed with `fromRequest` or
@@ -568,7 +600,7 @@ object ZQuery {
    * Constructs a query from an effect that returns a result.
    */
   private def apply[R, E, A](step: ZIO[(R, QueryContext), Nothing, Result[R, E, A]]): ZQuery[R, E, A] =
-    new ZQuery(step)
+    new ZQuery(ZIO.unit, step)
 
   /**
    * Partitions the elements of a collection using the specified function.
